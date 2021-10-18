@@ -1,0 +1,93 @@
+import os
+import itertools
+import pandas as pd
+from snakemake.utils import Paramspace
+
+# config/config.yaml as default config file if none provided
+if not config:
+    configfile: "config/config.yaml"
+
+logs_dir = config["logs_dir"]
+
+""" SIMULATION CONFIG """
+
+sim_config = config["simulation"]
+sims_dir = sim_config["out_dir"]
+replicates = sim_config["replicates"]
+
+""" rule: run_simulation """
+
+if "parameters_file" in sim_config and os.path.isfile(sim_config["parameters_file"]):
+    # use provided parameter space from table
+    param_df = pd.read_csv(sim_config["parameters_file"], sep="\t")
+    paramspace = Paramspace(param_df, filename_params="*", param_sep="=")
+    params_pattern = paramspace.wildcard_pattern
+    params_instances = paramspace.instance_patterns
+    param_keys = param_df.columns.values
+else:
+    # use parameters in config.yaml to create all possible combinations
+    sim_params = sim_config["parameters"]
+    params_pattern = "_".join(["=".join((key, f"{{{key}}}")) for key in sim_params.keys()])
+    params_instances = expand(params_pattern, **{k: v for k, v in sim_params.items()})
+    param_keys = sim_params.keys()
+
+# create all output directories from parameter combinations
+sim_pattern = os.path.join(sims_dir, params_pattern) + "/R{replicate}"
+sim_results = expand(sim_pattern, allow_missing=True, replicate=range(0, replicates))
+
+""" ANALYSES CONFIG """
+
+analyses_config = config["analyses"]
+
+""" rule: create_maps """
+create_map_config = analyses_config["create_maps"]
+create_maps_dir = create_map_config["out_dir"]
+create_map_params = create_map_config["parameters"]
+
+create_maps_pattern = os.path.join(create_maps_dir, params_pattern) + ".npy"
+
+""" rule: plot_maps """
+plot_maps_config = analyses_config["plot_maps"]
+plot_maps_dir = plot_maps_config["out_dir"]
+
+plot_maps_pattern = os.path.join(plot_maps_dir, params_pattern) + ".png"
+plot_maps_results = expand(os.path.join(plot_maps_dir, "{params}") + ".png", params=params_instances)
+
+rule all:
+    input:
+        plot_maps_results
+
+""" SIMULATION RULES """
+
+rule run_simulation:
+    output:
+        directory(sim_pattern)
+    shell:
+        f"python {sim_config['script']} --out_dir {{output}} "
+            + " ".join([f"--{key} {{wildcards.{key}}}" for key in param_keys])
+
+""" ANALYSES RULES """
+
+rule create_maps:
+    input:
+        sim_results
+    output:
+        create_maps_pattern
+    threads:
+        1
+    shell:
+        " ".join(
+            [f"python {create_map_config['script']} --in_dirs \"{{input}}\" --out_dir {{output}}"]
+            + [f"--{key} {{wildcards.{key}}}" for key in param_keys]
+            + [f"--{key} {create_map_params[key]}" for key in create_map_params.keys()]
+        )
+
+rule plot_maps:
+    input:
+        create_maps_pattern
+    output:
+        plot_maps_pattern
+    threads:
+        1
+    shell:
+        f"python {plot_maps_config['script']} --in_file {{input}} --out_file {{output}} --name {config['name']}"
